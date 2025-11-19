@@ -99,7 +99,6 @@ app.post("/api/flow-events", (req, res) => {
   res.json({ ok: true });
 });
 
-// Only live queued tasks
 app.get("/api/tasks/queue", async (req, res) => {
   try {
     const { queueId } = req.query;
@@ -107,27 +106,26 @@ app.get("/api/tasks/queue", async (req, res) => {
       return res.status(400).json({ error: "queueId is required" });
     }
 
-    // last 15 minutes of activity should be enough to see queued calls
+    // Last 15 minutes in epoch milliseconds
     const now = Date.now();
     const fifteenMinutesAgo = now - 15 * 60 * 1000;
 
-    // Minimal, spec-aligned params for Get Tasks
+    // Match DevNet examples. orgId, channelTypes, from, to
     const params = {
       orgId: WXCC_ORG_ID,
-      channelType: "telephony",
-      fromDateTime: fifteenMinutesAgo,
-      toDateTime: now
+      channelTypes: "telephony",      // plural, per Cisco sample:contentReference[oaicite:1]{index=1}
+      from: fifteenMinutesAgo,
+      to: now
     };
 
     console.log("[/api/tasks/queue] Calling Get Tasks with params:", params);
 
     const data = await wxccRequest("get", "/tasks", { params });
 
-    // Be defensive about response shape
     const rawTasks = data.tasks || data.items || data || [];
     console.log("[/api/tasks/queue] Raw tasks count:", rawTasks.length);
 
-    // Filter in Node for just OUR queue + queued state
+    // Filter locally to our queue and queued state
     const filtered = rawTasks.filter((t) => {
       const state = (t.state || t.status || "").toUpperCase();
       const qId = t.queueId || t.queueName || t.queue || "";
