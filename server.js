@@ -7,11 +7,8 @@ const cors = require("cors");
 const path = require("path");
 
 const app = express();
-app.use(express.json());
 app.use(cors());
-
-// Serve static frontend bundle (web component) from /public
-app.use("/static", express.static(path.join(__dirname, "public")));
+app.use(express.json());
 
 const {
   PORT = 3000,
@@ -22,11 +19,13 @@ const {
   WXCC_ORG_ID
 } = process.env;
 
-// Very simple in memory store for Flow Designer events
-// key: taskId  value: metadata from Flow Designer
+// Serve static web component at /static/cherry-picker.js
+app.use("/static", express.static(path.join(__dirname, "public")));
+
+// Optional. store metadata sent from Flow Designer
 const flowEventStore = new Map();
 
-// Cache OAuth token
+// OAuth token cache
 let cachedToken = null;
 let tokenExpiry = 0;
 
@@ -51,39 +50,38 @@ async function getAccessToken() {
   return cachedToken;
 }
 
-/**
- * Utility for calling WxCC APIs
- */
 async function wxccRequest(method, urlPath, options = {}) {
   const token = await getAccessToken();
 
-  const resp = await axios({
-    method,
-    url: `${WXCC_BASE_URL}${urlPath}`,
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-      ...(options.headers || {})
-    },
-    params: options.params,
-    data: options.data
-  });
-
-  return resp.data;
+  try {
+    const resp = await axios({
+      method,
+      url: `${WXCC_BASE_URL}${urlPath}`,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+        ...(options.headers || {})
+      },
+      params: options.params,
+      data: options.data
+    });
+    return resp.data;
+  } catch (err) {
+    const status = err.response?.status;
+    const data = err.response?.data;
+    console.error("[WxCC API error]", {
+      method,
+      url: `${WXCC_BASE_URL}${urlPath}`,
+      status,
+      data
+    });
+    throw err;
+  }
 }
 
-/**
- * Flow Designer will call this before queuing.
- * Store ANI, queueId, and anything else keyed by taskId.
- */
+// Flow Designer hook, optional but useful
 app.post("/api/flow-events", (req, res) => {
-  const {
-    taskId,
-    interactionId,
-    callerId,
-    queueId,
-    extra
-  } = req.body;
+  const { taskId, interactionId, callerId, queueId, extra } = req.body;
 
   if (!taskId) {
     return res.status(400).json({ error: "taskId is required" });
@@ -100,15 +98,7 @@ app.post("/api/flow-events", (req, res) => {
   res.json({ ok: true });
 });
 
-/**
- * Get tasks currently in a given queue.
- * This uses the WxCC Get Tasks data API.
- *
- * Important.
- * Check your developer docs for the exact query parameters.
- * The example assumes:
- *   GET /tasks?orgId=...&queueId=...&state=queued
- */
+// Only live queued tasks
 app.get("/api/tasks/queue", async (req, res) => {
   try {
     const { queueId } = req.query;
@@ -116,94 +106,53 @@ app.get("/api/tasks/queue", async (req, res) => {
       return res.status(400).json({ error: "queueId is required" });
     }
 
+    // Adjust parameter names and values to match Get Tasks API spec in your tenant
     const params = {
       orgId: WXCC_ORG_ID,
-      // Adjust param names to match reference docs
+      // examples. you may need to rename these based on docs
       queueId,
-      state: "queued"
+      state: "QUEUED",
+      channelType: "TELEPHONY"
     };
 
     const data = await wxccRequest("get", "/tasks", { params });
 
-    // Assume data.tasks is the array, adjust if needed
-    const tasks = (data.tasks || []).map((t) => {
-      const flowMeta = flowEventStore.get(t.id) || {};
+    // Try to be defensive in case schema is tasks, items, or plain array
+    const rawTasks = data.tasks || data.items || data || [];
+    const tasks = rawTasks.map((t) => {
+      const id = t.id || t.taskId;
+      const flowMeta = id ? flowEventStore.get(id) || {} : {};
+
       return {
-        id: t.id,
-        interactionId: t.interactionId,
-        queueId: t.queueId,
-        channelType: t.channelType,
-        createdTime: t.createdTime,
-        // These fields are often on the interaction or task data model
-        ani: t.ani || t.fromAddress || null,
+        id,
+        interactionId: t.interactionId || t.interactionIdRef,
+        queueId: t.queueId || queueId,
+        channelType: t.channelType || t.channel || "telephony",
+        createdTime: t.createdTime || t.createdAt,
+        ani: t.ani || t.fromAddress || t.callerId || null,
         dnis: t.dnis || t.toAddress || null,
-        // Flow metadata enrichment
+        state: t.state || t.status,
+        // optional enrichment from Flow Designer
         callerId: flowMeta.callerId || t.ani || null,
-        flowMeta
+        waitTimeSeconds: t.waitTimeSeconds || null
       };
     });
 
     res.json({ tasks });
   } catch (err) {
-    console.error("Error in /api/tasks/queue", err.response?.data || err);
-    res.status(500).json({ error: "Failed to fetch tasks" });
-  }
-});
+    const status = err.response?.status || 500;
+    const details = err.response?.data || err.message;
+    console.error("[/api/tasks/queue] error", status, details);
 
-/**
- * Get last 24h worth of tasks for history.
- *
- * Example assumes:
- *   GET /tasks?orgId=...&fromTime=...&toTime=...&states=...
- * Adjust param names to match your Get Tasks reference.
- */
-app.get("/api/tasks/history", async (req, res) => {
-  try {
-    const now = Date.now();
-    const from = new Date(now - 24 * 60 * 60 * 1000).toISOString();
-    const to = new Date(now).toISOString();
-
-    const params = {
-      orgId: WXCC_ORG_ID,
-      fromTime: from,
-      toTime: to,
-      // Completed states for history. Adjust to your data model
-      states: "completed,abandoned,terminated"
-    };
-
-    const data = await wxccRequest("get", "/tasks", { params });
-
-    const tasks = (data.tasks || []).map((t) => {
-      const flowMeta = flowEventStore.get(t.id) || {};
-      return {
-        id: t.id,
-        interactionId: t.interactionId,
-        queueId: t.queueId,
-        channelType: t.channelType,
-        createdTime: t.createdTime,
-        endTime: t.endTime,
-        ani: t.ani || t.fromAddress || null,
-        dnis: t.dnis || t.toAddress || null,
-        callerId: flowMeta.callerId || t.ani || null,
-        flowMeta
-      };
+    res.status(500).json({
+      error: "Failed to fetch queue tasks from WxCC",
+      status,
+      details
     });
-
-    res.json({ tasks });
-  } catch (err) {
-    console.error("Error in /api/tasks/history", err.response?.data || err);
-    res.status(500).json({ error: "Failed to fetch history tasks" });
   }
 });
 
-/**
- * Assign task to an agent.
- *
- * Example assumes Task Control endpoint is:
- *   POST /tasks/{taskId}/assign
- * with body including orgId and agentId.
- * Check Tasks Call Control reference to confirm field names.:contentReference[oaicite:6]{index=6}
- */
+// Assign one task to the requesting agent
 app.post("/api/tasks/:taskId/assign", async (req, res) => {
   try {
     const { taskId } = req.params;
@@ -216,25 +165,33 @@ app.post("/api/tasks/:taskId/assign", async (req, res) => {
     const body = {
       orgId: WXCC_ORG_ID,
       agentId,
-      // Optional. For example, DEV or DN if required by your tenant
       deviceId: deviceId || undefined
     };
 
-    const result = await wxccRequest("post", `/tasks/${taskId}/assign`, {
-      data: body
-    });
+    const data = await wxccRequest(
+      "post",
+      `/tasks/${encodeURIComponent(taskId)}/assign`,
+      { data: body }
+    );
 
-    res.json({ ok: true, result });
+    res.json({ ok: true, result: data });
   } catch (err) {
-    console.error("Error in /api/tasks/:taskId/assign", err.response?.data || err);
-    res.status(500).json({ error: "Failed to assign task" });
+    const status = err.response?.status || 500;
+    const details = err.response?.data || err.message;
+    console.error("[/api/tasks/:taskId/assign] error", status, details);
+
+    res.status(500).json({
+      error: "Failed to assign task in WxCC",
+      status,
+      details
+    });
   }
 });
 
 app.get("/", (req, res) => {
-  res.send("WxCC Cherry Picker backend is running.");
+  res.send("WxCC Cherry Picker backend, live queue only.");
 });
 
 app.listen(PORT, () => {
-  console.log(`WxCC Cherry Picker backend on port ${PORT}`);
+  console.log(`WxCC Cherry Picker backend listening on port ${PORT}`);
 });

@@ -10,50 +10,48 @@ class WxccCherryPicker extends HTMLElement {
 
     this.state = {
       queueTasks: [],
-      historyTasks: [],
-      error: null,
       loading: false,
+      error: null
     };
+
+    this.refreshInterval = null;
   }
 
   connectedCallback() {
-    // Attributes from layout
+    // Get attributes from layout
     const attrAgentId = this.getAttribute("agent-id");
     const attrOrgId = this.getAttribute("org-id");
     const attrQueueId = this.getAttribute("queue-id");
     const attrApiBase = this.getAttribute("api-base");
 
-    // Properties from layout (Desktop might set these on the element)
-    const propAgentId = this.agentId;
-    const propOrgId = this.orgId;
-    const propQueueId = this.queueId;
-    const propApiBase = this.apiBase;
+    // Resolve values, with safe defaults
+    this.agentId = attrAgentId || "unknown-agent";
+    this.orgId = attrOrgId || "unknown-org";
+    this.queueId = attrQueueId || "default-queue";
 
-    // Resolve values, preferring properties, then attributes, then defaults
-    this.agentId = propAgentId || attrAgentId || "unknown-agent";
-    this.orgId = propOrgId || attrOrgId || "unknown-org";
-    this.queueId = propQueueId || attrQueueId || "Matt_Voice";
-
-    // IMPORTANT. hardcoded fallback to Render backend
+    // Fallback apiBase to Render if not provided
     this.apiBase =
-      propApiBase ||
-      attrApiBase ||
-      "https://wxcc-cherry-picker.onrender.com/api";
+      attrApiBase || "https://wxcc-cherry-picker.onrender.com/api";
 
-    console.log("[CherryPicker] Resolved values:", {
-      attrAgentId,
-      attrOrgId,
-      attrQueueId,
-      attrApiBase,
-      propAgentId,
-      propOrgId,
-      propQueueId,
-      propApiBase,
-      apiBase: this.apiBase,
+    console.log("[CherryPicker] init", {
+      agentId: this.agentId,
+      orgId: this.orgId,
+      queueId: this.queueId,
+      apiBase: this.apiBase
     });
 
     this.render();
-    this.loadData();
+    this.loadQueue();
+
+    // auto refresh every 10 seconds
+    this.refreshInterval = setInterval(() => this.loadQueue(), 10_000);
+  }
+
+  disconnectedCallback() {
+    if (this.refreshInterval) {
+      clearInterval(this.refreshInterval);
+      this.refreshInterval = null;
+    }
   }
 
   setState(partial) {
@@ -61,160 +59,155 @@ class WxccCherryPicker extends HTMLElement {
     this.render();
   }
 
-  async loadData() {
+  async loadQueue() {
     try {
       this.setState({ loading: true, error: null });
 
-      const queueUrl = `${this.apiBase}/tasks/queue?queueId=${encodeURIComponent(
+      const url = `${this.apiBase}/tasks/queue?queueId=${encodeURIComponent(
         this.queueId
       )}`;
-      const historyUrl = `${this.apiBase}/tasks/history?hours=24&queueId=${encodeURIComponent(
-        this.queueId
-      )}`;
+      console.log("[CherryPicker] fetch queue", url);
 
-      console.log("[CherryPicker] Fetching:", { queueUrl, historyUrl });
+      const resp = await fetch(url);
+      const text = await resp.text();
 
-      const [queueResp, historyResp] = await Promise.all([
-        fetch(queueUrl, { credentials: "include" }),
-        fetch(historyUrl, { credentials: "include" }),
-      ]);
-
-      // Read as text first so we can see if it is HTML
-      const queueText = await queueResp.text();
-      const historyText = await historyResp.text();
-
-      console.log("[CherryPicker] Queue response snippet:", {
-        status: queueResp.status,
-        bodyStart: queueText.slice(0, 200),
-      });
-      console.log("[CherryPicker] History response snippet:", {
-        status: historyResp.status,
-        bodyStart: historyText.slice(0, 200),
+      console.log("[CherryPicker] queue resp snippet", {
+        status: resp.status,
+        bodyStart: text.slice(0, 200)
       });
 
-      if (!queueResp.ok) {
-        throw new Error(`Queue API error ${queueResp.status}`);
-      }
-      if (!historyResp.ok) {
-        throw new Error(`History API error ${historyResp.status}`);
+      if (!resp.ok) {
+        throw new Error(`Queue API error ${resp.status}`);
       }
 
-      let queueData;
-      let historyData;
+      let data;
       try {
-        queueData = JSON.parse(queueText);
-        historyData = JSON.parse(historyText);
+        data = JSON.parse(text);
       } catch (e) {
-        console.error("[CherryPicker] JSON parse error", e);
+        console.error("[CherryPicker] queue JSON parse error", e);
         throw new Error(
-          "Backend did not return valid JSON. see console for raw response"
+          "Backend did not return valid JSON for queue. see console"
         );
       }
 
       this.setState({
-        queueTasks: queueData.tasks || [],
-        historyTasks: historyData.tasks || [],
-        loading: false,
+        queueTasks: data.tasks || [],
+        loading: false
       });
     } catch (err) {
-      console.error("Failed to load data", err);
+      console.error("[CherryPicker] loadQueue error", err);
       this.setState({
         loading: false,
-        error: "Failed to load tasks from backend",
+        error: err.message || "Failed to load queue"
       });
     }
   }
 
   async claimTask(taskId) {
+    if (!taskId) return;
+    if (!this.agentId || this.agentId === "unknown-agent") {
+      alert("Missing agentId, cannot claim task");
+      return;
+    }
+
     try {
-      const url = `${this.apiBase}/tasks/assign`;
-      console.log("[CherryPicker] Claiming task", { url, taskId });
+      const url = `${this.apiBase}/tasks/${encodeURIComponent(
+        taskId
+      )}/assign`;
+      console.log("[CherryPicker] assign", { url, taskId, agentId: this.agentId });
 
       const resp = await fetch(url, {
         method: "POST",
-        credentials: "include",
-        headers: {
-          "Content-Type": "application/json",
-        },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          taskId,
           agentId: this.agentId,
-          orgId: this.orgId,
-        }),
+          orgId: this.orgId
+        })
       });
 
       const text = await resp.text();
-      console.log("[CherryPicker] Assign response snippet:", {
+      console.log("[CherryPicker] assign resp snippet", {
         status: resp.status,
-        bodyStart: text.slice(0, 200),
+        bodyStart: text.slice(0, 200)
       });
 
       if (!resp.ok) {
-        throw new Error(`Assign failed ${resp.status}`);
+        throw new Error(`Assign API error ${resp.status}`);
       }
 
-      // Reparse as JSON in case you want to use the payload
-      const data = text ? JSON.parse(text) : {};
-      console.log("[CherryPicker] Assign parsed data", data);
+      // optional parse of JSON
+      // const data = text ? JSON.parse(text) : {};
+      // console.log("[CherryPicker] assign data", data);
 
-      this.loadData();
+      // refresh queue after success
+      this.loadQueue();
     } catch (err) {
-      console.error("Failed to assign task", err);
-      alert("Failed to assign task. check console logs for details");
+      console.error("[CherryPicker] claimTask error", err);
+      alert("Failed to assign task, see console for details");
     }
   }
 
   render() {
-    const { queueTasks, historyTasks, error, loading } = this.state;
+    const { queueTasks, loading, error } = this.state;
 
     this.shadowRoot.innerHTML = `
       <style>
         :host {
-          font-family: Arial, sans-serif;
           display: block;
-          height: 100%;
+          font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+          font-size: 12px;
+          color: #222;
           box-sizing: border-box;
+          height: 100%;
           padding: 8px;
         }
         h2 {
-          margin: 0 0 8px 0;
-          font-size: 18px;
+          margin: 0 0 4px 0;
+          font-size: 16px;
         }
         .header {
-          font-size: 12px;
-          margin-bottom: 8px;
+          font-size: 11px;
           color: #555;
-        }
-        .section-title {
-          font-weight: bold;
-          margin-top: 12px;
-          margin-bottom: 4px;
+          margin-bottom: 8px;
         }
         .error {
           color: #b00020;
-          margin: 8px 0;
+          margin: 4px 0;
+        }
+        .loading {
+          font-size: 11px;
+          color: #777;
+          margin-bottom: 4px;
         }
         table {
           width: 100%;
           border-collapse: collapse;
-          font-size: 12px;
+          margin-top: 4px;
         }
         th, td {
           border: 1px solid #ddd;
           padding: 4px 6px;
           text-align: left;
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
         }
         th {
-          background: #f4f4f4;
+          background: #f3f3f3;
+          font-weight: 600;
         }
         button {
+          padding: 2px 8px;
           font-size: 11px;
-          padding: 2px 6px;
+          border-radius: 3px;
+          border: 1px solid #0b5fff;
+          background: #0b5fff;
+          color: #fff;
           cursor: pointer;
         }
-        .loading {
-          font-size: 12px;
-          color: #777;
+        button:disabled {
+          opacity: 0.6;
+          cursor: default;
         }
       </style>
       <div>
@@ -222,82 +215,63 @@ class WxccCherryPicker extends HTMLElement {
         <div class="header">
           Agent: ${this.agentId}  |  Queue: ${this.queueId}
         </div>
-        ${loading ? `<div class="loading">Loading...</div>` : ""}
+        ${loading ? `<div class="loading">Loading queue...</div>` : ""}
         ${error ? `<div class="error">${error}</div>` : ""}
-        <div class="section-title">Calls in Queue</div>
-        ${queueTasks.length === 0
-          ? "<div>No tasks in queue</div>"
-          : `
+        ${
+          queueTasks.length === 0 && !loading
+            ? `<div>No tasks currently in queue</div>`
+            : `
           <table>
             <thead>
               <tr>
                 <th>Task ID</th>
+                <th>Caller ID</th>
                 <th>ANI</th>
-                <th>Waiting (s)</th>
+                <th>DNIS</th>
+                <th>State</th>
+                <th>Wait (s)</th>
                 <th>Action</th>
               </tr>
             </thead>
             <tbody>
               ${queueTasks
-                .map(
-                  (t) => `
-                <tr>
-                  <td>${t.id || t.taskId || ""}</td>
-                  <td>${t.ani || t.callerId || ""}</td>
-                  <td>${t.waitTimeSeconds ?? ""}</td>
-                  <td>
-                    <button data-task-id="${
-                      t.id || t.taskId || ""
-                    }">Claim</button>
-                  </td>
-                </tr>
-              `
-                )
+                .map((t) => {
+                  const id = t.id || t.taskId || "";
+                  const caller = t.callerId || t.ani || "";
+                  const ani = t.ani || "";
+                  const dnis = t.dnis || "";
+                  const state = t.state || "";
+                  const wait = t.waitTimeSeconds ?? "";
+                  return `
+                    <tr>
+                      <td title="${id}">${id}</td>
+                      <td>${caller}</td>
+                      <td>${ani}</td>
+                      <td>${dnis}</td>
+                      <td>${state}</td>
+                      <td>${wait}</td>
+                      <td>
+                        <button data-task-id="${id}">Claim</button>
+                      </td>
+                    </tr>
+                  `;
+                })
                 .join("")}
             </tbody>
           </table>
-        `}
-        <div class="section-title">Last 24 hours</div>
-        ${historyTasks.length === 0
-          ? "<div>No history</div>"
-          : `
-          <table>
-            <thead>
-              <tr>
-                <th>Task ID</th>
-                <th>ANI</th>
-                <th>Result</th>
-                <th>Ended</th>
-              </tr>
-            </thead>
-            <tbody>
-              ${historyTasks
-                .map(
-                  (t) => `
-                <tr>
-                  <td>${t.id || t.taskId || ""}</td>
-                  <td>${t.ani || t.callerId || ""}</td>
-                  <td>${t.outcome || t.state || ""}</td>
-                  <td>${t.endedAt || ""}</td>
-                </tr>
-              `
-                )
-                .join("")}
-            </tbody>
-          </table>
-        `}
+        `
+        }
       </div>
     `;
 
-    // Wire Claim buttons
-    this.shadowRoot.querySelectorAll("button[data-task-id]").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        const taskId = btn.getAttribute("data-task-id");
-        if (taskId) {
+    this.shadowRoot
+      .querySelectorAll("button[data-task-id]")
+      .forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const taskId = btn.getAttribute("data-task-id");
           this.claimTask(taskId);
-        }
+        });
       });
-    });
   }
 }
 
